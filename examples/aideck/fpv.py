@@ -43,7 +43,19 @@ For the example to run the following hardware is needed:
  * Crazyradio PA
  * Flow v2 deck
  * AI deck 1.1
+
+Before you start the script please ensure:
+    1. You have flashed stm32, nrf and esp32 with correct firmware.
+    2. GAP8 has wifi-streaming firmware.
+    3. You're on the same wifi as the aideck.
+
+You can then invoke script by:
+    CFLIB_URI=tcp://192.168.4.1:5000 python examples/aideck/fpv.py
+
 """
+
+from collections import namedtuple
+from cfclient.utils.input import JoystickReader
 import logging
 import struct
 import sys
@@ -66,9 +78,12 @@ except ImportError:
 
 from PyQt5 import QtCore, QtWidgets, QtGui
 
+from go import Joystick, Target
+
 logging.basicConfig(level=logging.INFO)
 
 URI = uri_helper.uri_from_env(default='radio://0/80/2M/E7E7E7E7E7')
+
 
 CAM_HEIGHT = 244
 CAM_WIDTH = 324
@@ -98,6 +113,78 @@ class ImageDownloader(threading.Thread):
 
                 bayer_img = np.frombuffer(imgStream, dtype=np.uint8)
                 self._cb(bayer_img)
+
+
+Target = namedtuple('Target', ['roll', 'pitch', 'yaw', 'thrust'])
+
+
+class Joystick:
+    '''
+    This class reads connected joystick and calls callback function
+    "on_new_data" when new data has arrived.
+    '''
+
+    def __init__(self, on_new_data: callable = None) -> None:
+        '''
+        Parameters:
+            on_new_data - Callback function that takes argument:
+                Tuple[roll: float, pitch: float, yaw: float, thrust: int]
+        '''
+        self._jr = JoystickReader(False)
+        self._reading: Target = Target(0, 0, 0, 0)
+        self._on_new_data = on_new_data
+
+    def start(self, input_map: str = 'PS3_Mode_1') -> bool:
+        '''
+        Tries to connect to the first device found.
+        Returns True on success, False if no device is found.
+
+        Parameters:
+            input_map - A string with the correct mapping to use for joystick.
+        '''
+        devices = self._jr.available_devices()
+        if not devices:
+            print('Found no devices!')
+            return False
+
+        print(f'Found {len(devices)} devices:')
+        for dev in devices:
+            print(f'  - {dev.name}')
+
+        # Just choose first device found
+        dev = devices[0]
+        print(f'Choosing deivce {dev.name}')
+
+        if self._on_new_data is None:
+            print('No callback supplied for new data!')
+            self._on_new_data = self._print_new_data
+
+        # Add callbacks for JoystickReader
+        self._jr.device_error.add_callback(lambda err: print(err))
+        self._jr.input_updated.add_callback(self._new_data_cb)
+
+        self._jr.set_input_map(dev.name, input_map)
+        self._jr.start_input(dev.name)
+
+        print(f'Started joystick with device {dev.name}')
+
+        return True
+
+    def read(self) -> Target:
+        return self._reading
+
+    def _print_new_data(self, target: Target) -> None:
+        print(target)
+
+    def _new_data_cb(self, roll: float, pitch: float, yaw: float, thrust: int):
+        # Value ranges with PS3_Mode_1. These are probably different for each mapping.
+        #        Low  Mid  Max
+        # Yaw:    0  -200 -450
+        # Thrust: 0       52000
+        # Pitch:  -30   0   30
+        # Roll:   -30  0  30
+        self._reading = Target(roll, pitch, yaw, thrust)
+        self._on_new_data(self._reading)
 
 
 class MainWindow(QtWidgets.QWidget):
@@ -164,8 +251,15 @@ class MainWindow(QtWidgets.QWidget):
         self.cf.connected.add_callback(self.connected)
         self.cf.disconnected.add_callback(self.disconnected)
 
+        self.joystick = Joystick(self._new_joystick_data)
+
+        self.hover = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 'height': 0.3}
+
         # Connect to the Crazyflie
         self.cf.open_link(URI)
+
+        if not self.joystick.start():
+            print('Failed to find connected joystick!')
 
         if not self.cf.link:
             print('Could not connect to Crazyflie')
@@ -178,12 +272,11 @@ class MainWindow(QtWidgets.QWidget):
             self._imgDownload = ImageDownloader(self.cf.link.cpx, self.updateImage)
             self._imgDownload.start()
 
-            self.hover = {'x': 0.0, 'y': 0.0, 'z': 0.0, 'yaw': 0.0, 'height': 0.3}
-
             self.hoverTimer = QtCore.QTimer()
             self.hoverTimer.timeout.connect(self.sendHoverCommand)
             self.hoverTimer.setInterval(100)
             self.hoverTimer.start()
+
 
     def updateImage(self, image):
         i = QtGui.QImage(image, CAM_WIDTH, CAM_HEIGHT, QtGui.QImage.Format_Grayscale8).scaled(324*2, 244*2)
@@ -280,6 +373,31 @@ class MainWindow(QtWidgets.QWidget):
         if (self.cf is not None):
             self.cf.close_link()
 
+    def _new_joystick_data(self, target: Target) -> None:
+        # Value ranges with PS3_Mode_1. These are probably different for each mapping.
+        #        Low  Mid  Max
+        # Yaw:    0  -200 -450
+        # Thrust: 0       52000
+        # Pitch:  -30   0   30
+        # Roll:   -30  0  30
+        if target.yaw < -150:
+            self.updateHover('yaw', -70)
+        elif target.yaw > 150:
+            self.updateHover('yaw', -70)
+
+        if target.pitch < 0:
+            self.updateHover('x', -1)
+        elif target.pitch > 0:
+            self.updateHover('x', 1)
+
+        if target.roll < 0:
+            self.updateHover('y', 1)
+        elif target.roll > 0:
+            self.updateHover('y', -1)
+
+        # TODO: Thrust goes from 0-52000, so can't go down.
+        if target.thrust > 0:
+            pass
 
 if __name__ == '__main__':
     appQt = QtWidgets.QApplication(sys.argv)
